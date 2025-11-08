@@ -46,6 +46,48 @@ Follow me on [X @nummanthinks](https://x.com/nummanthinks) for future updates an
 - ✅ **Type-safe & tested** - Strict TypeScript with 159 unit tests + 14 integration tests
 - ✅ **Modular architecture** - Easy to maintain and extend
 
+## Standalone Codex Proxy (Beta)
+
+Want to reuse the OAuth + Codex transport outside of opencode? A lightweight HTTP proxy is bundled so other tools (for example [claude-code-gpt-5](https://github.com/teremterem/claude-code-gpt-5)) can reach ChatGPT’s Codex backend via OAuth.
+
+### Run the proxy
+
+1. Build once: `npm run build`
+2. Start the proxy: `npm run codex-proxy`
+3. Complete the browser-based OAuth flow (tokens are cached at `~/.opencode/codex-oauth-token.json` and refresh automatically).
+
+Environment knobs:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `CODEX_PROXY_PORT` | `9000` | HTTP port for `/v1/responses` |
+| `CODEX_PROXY_HOST` | `127.0.0.1` | Bind address |
+| `CODEX_PROXY_TOKEN_PATH` | `~/.opencode/codex-oauth-token.json` | Override token cache location |
+| `CODEX_PROXY_LOG_PATH` | `~/.opencode/logs/codex-proxy-errors.ndjson` | File where upstream 4xx/5xx responses are logged |
+| `CODEX_PROXY_FORCE_JSON` | `1` | When `1`, convert Codex SSE streams to final JSON before returning (required for LiteLLM today, disables live streaming). Set to `0` only if your client can consume raw SSE. |
+
+Health check: `GET http://HOST:PORT/health`
+
+When Codex returns an error, a JSON line with the trace id, status, and trimmed response body is appended to the log file so you can inspect/share failures easily.
+
+### Hook it up to claude-code-gpt-5
+
+In `claude-code-gpt-5/.env`:
+
+```dotenv
+OPENAI_API_KEY=dummy-oauth
+OPENAI_BASE_URL=http://127.0.0.1:9000
+REMAP_CLAUDE_HAIKU_TO=gpt-5-codex-low
+REMAP_CLAUDE_SONNET_TO=gpt-5-codex-medium
+REMAP_CLAUDE_OPUS_TO=gpt-5-codex-high
+```
+
+1. Start the codex proxy (`npm run codex-proxy`)
+2. Start LiteLLM inside `claude-code-gpt-5` (`uv run litellm --config config.yaml` or `./uv-run.sh`)
+3. Run the Claude Code CLI with `ANTHROPIC_BASE_URL=http://localhost:4000 claude`
+
+LiteLLM forwards every `openai/*` Responses call to `http://127.0.0.1:9000/v1/responses`. The proxy rewrites it to `https://chatgpt.com/backend-api/codex/responses`, injects your OAuth headers, and streams Codex responses back to Claude Code.
+
 ## Installation
 
 ### Quick Start

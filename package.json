@@ -33,7 +33,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:ui": "vitest --ui",
-    "test:coverage": "vitest run --coverage"
+    "test:coverage": "vitest run --coverage",
+    "codex-proxy": "node dist/lib/proxy/server.js"
   },
   "files": [
     "dist/",

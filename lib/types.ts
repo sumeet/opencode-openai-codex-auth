@@ -137,6 +137,7 @@ export interface RequestBody {
 	prompt_cache_key?: string;
 	max_output_tokens?: number;
 	max_completion_tokens?: number;
+	metadata?: Record<string, unknown>;
 	[key: string]: unknown;
 }
 
