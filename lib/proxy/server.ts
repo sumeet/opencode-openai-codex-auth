@@ -323,19 +323,8 @@ async function handleResponsesEndpoint(
             });
         }
 
-        const DISABLE_DEV_GUIDE = process.env.CODEX_PROXY_DISABLE_DEV_GUIDE === '1';
-        if (!DISABLE_DEV_GUIDE && inferredDevGuide && inferredDevGuide.trim()) {
-            // Only add the inferred guide if the first developer/system message isn't identical already
-            const firstDev = (originalInput.find((it: any) => it && (it.role === 'developer' || it.role === 'system')) || null);
-            const firstDevText = firstDev ? extractTextFromContent(firstDev.content).trim() : '';
-            if (firstDevText !== inferredDevGuide.trim()) {
-                newInput.push({
-                    type: "message",
-                    role: "developer",
-                    content: [{ type: "input_text", text: inferredDevGuide.trim() }],
-                });
-            }
-        }
+        // Keep it simple: do not duplicate or reposition existing developer/system guidance.
+        // We only prepend the environment override, then append the original input as-is.
 
         // Append original input
         for (const item of originalInput) newInput.push(item);
