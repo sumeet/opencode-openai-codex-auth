@@ -1,5 +1,6 @@
 import { TOOL_REMAP_MESSAGE } from "../prompts/codex.js";
 import { CODEX_OPENCODE_BRIDGE } from "../prompts/codex-opencode-bridge.js";
+import { CLAUDE_CODE_TOOL_GUIDE } from "../prompts/claude-code.js";
 import { getOpenCodeCodexPrompt } from "../prompts/opencode-codex.js";
 import { logDebug, logWarn } from "../logger.js";
 import type {
@@ -9,6 +10,15 @@ import type {
 	RequestBody,
 	InputItem,
 } from "../types.js";
+
+const TOOL_PROFILE = (process.env.CODEX_TOOL_PROFILE || "opencode").toLowerCase();
+const TOOL_GUIDE_MESSAGE =
+	TOOL_PROFILE === "claude"
+		? CLAUDE_CODE_TOOL_GUIDE
+		: TOOL_PROFILE === "opencode"
+		?
+			TOOL_REMAP_MESSAGE
+		: undefined;
 
 /**
  * Normalize model name to Codex-supported variants
@@ -244,24 +254,25 @@ export function addCodexBridgeMessage(
  * @param hasTools - Whether tools are present in request
  * @returns Input array with tool remap message prepended if needed
  */
-export function addToolRemapMessage(
+export function addToolGuideMessage(
 	input: InputItem[] | undefined,
 	hasTools: boolean,
+	messageText?: string,
 ): InputItem[] | undefined {
-	if (!hasTools || !Array.isArray(input)) return input;
+	if (!hasTools || !Array.isArray(input) || !messageText) return input;
 
-	const toolRemapMessage: InputItem = {
+	const guideMessage: InputItem = {
 		type: "message",
 		role: "developer",
 		content: [
 			{
 				type: "input_text",
-				text: TOOL_REMAP_MESSAGE,
+				text: messageText,
 			},
 		],
 	};
 
-	return [toolRemapMessage, ...input];
+	return [guideMessage, ...input];
 }
 
 /**
@@ -333,8 +344,8 @@ export async function transformRequestBody(
 			body.input = await filterOpenCodeSystemPrompts(body.input);
 			body.input = addCodexBridgeMessage(body.input, !!body.tools);
 		} else {
-			// DEFAULT MODE: Keep original behavior with tool remap message
-			body.input = addToolRemapMessage(body.input, !!body.tools);
+			// DEFAULT MODE: Optionally inject tool guidance message
+			body.input = addToolGuideMessage(body.input, !!body.tools, TOOL_GUIDE_MESSAGE);
 		}
 	}
 

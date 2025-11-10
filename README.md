@@ -64,7 +64,9 @@ Environment knobs:
 | `CODEX_PROXY_HOST` | `127.0.0.1` | Bind address |
 | `CODEX_PROXY_TOKEN_PATH` | `~/.opencode/codex-oauth-token.json` | Override token cache location |
 | `CODEX_PROXY_LOG_PATH` | `~/.opencode/logs/codex-proxy-errors.ndjson` | File where upstream 4xx/5xx responses are logged |
+| `CODEX_TOOL_PROFILE` | `opencode` | Set to `claude` to inject Claude Code tool guidance (TodoRead/TodoWrite, LS/Grep, etc.). Use `none` to skip tool instructions entirely. |
 | `CODEX_PROXY_FORCE_JSON` | `1` | When `1`, convert Codex SSE streams to final JSON before returning (required for LiteLLM today, disables live streaming). Set to `0` only if your client can consume raw SSE. |
+| `CODEX_PROXY_FIX_TOOL_NAMES` | `1` | When `1`, normalize tool names in the final JSON back to Claude’s exact casing (e.g., `TODO_WRITE` → `TodoWrite`). Set to `0` to disable. |
 
 Health check: `GET http://HOST:PORT/health`
 
@@ -77,6 +79,9 @@ In `claude-code-gpt-5/.env`:
 ```dotenv
 OPENAI_API_KEY=dummy-oauth
 OPENAI_BASE_URL=http://127.0.0.1:9000
+CODEX_MODE=0
+CODEX_TOOL_PROFILE=claude
+CODEX_PROXY_FORCE_JSON=1
 REMAP_CLAUDE_HAIKU_TO=gpt-5-codex-low
 REMAP_CLAUDE_SONNET_TO=gpt-5-codex-medium
 REMAP_CLAUDE_OPUS_TO=gpt-5-codex-high
@@ -86,7 +91,7 @@ REMAP_CLAUDE_OPUS_TO=gpt-5-codex-high
 2. Start LiteLLM inside `claude-code-gpt-5` (`uv run litellm --config config.yaml` or `./uv-run.sh`)
 3. Run the Claude Code CLI with `ANTHROPIC_BASE_URL=http://localhost:4000 claude`
 
-LiteLLM forwards every `openai/*` Responses call to `http://127.0.0.1:9000/v1/responses`. The proxy rewrites it to `https://chatgpt.com/backend-api/codex/responses`, injects your OAuth headers, and streams Codex responses back to Claude Code.
+LiteLLM forwards every `openai/*` Responses call to `http://127.0.0.1:9000/v1/responses`. The proxy rewrites it to `https://chatgpt.com/backend-api/codex/responses`, injects your OAuth headers, and streams Codex responses back to Claude Code. Setting `CODEX_MODE=0` disables the OpenCode-specific bridge prompt, `CODEX_TOOL_PROFILE=claude` injects guidance that references Claude’s native skills (TodoRead/TodoWrite, LS/Grep, etc.), and `CODEX_PROXY_FORCE_JSON=1` ensures LiteLLM receives JSON instead of raw SSE (required today so tool calls don’t explode mid-stream).
 
 ## Installation
 

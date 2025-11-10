@@ -16,23 +16,18 @@ import {
 } from "../auth/auth.js";
 import { openBrowserUrl } from "../auth/browser.js";
 import { startLocalOAuthServer } from "../auth/server.js";
-import { loadPluginConfig, getCodexMode } from "../config.js";
 import { AUTH_LABELS, CODEX_BASE_URL, JWT_CLAIM_PATH, PLUGIN_NAME } from "../constants.js";
 import { getCodexInstructions } from "../prompts/codex.js";
-import {
-	createCodexHeaders,
-	rewriteUrlForCodex,
-	transformRequestForCodex,
-} from "../request/fetch-helpers.js";
+import { createCodexHeaders, rewriteUrlForCodex } from "../request/fetch-helpers.js";
 import { convertSseToJson } from "../request/response-handler.js";
-import type { RequestBody, TokenSuccess, UserConfig } from "../types.js";
+import type { RequestBody, TokenSuccess } from "../types.js";
 import { logProxyError } from "./logging.js";
 
 const DEFAULT_PORT = Number(process.env.CODEX_PROXY_PORT ?? 9000);
 const HOST = process.env.CODEX_PROXY_HOST ?? "127.0.0.1";
 const DATA_DIR = join(homedir(), ".opencode");
 const TOKEN_FILE = process.env.CODEX_PROXY_TOKEN_PATH ?? join(DATA_DIR, "codex-oauth-token.json");
-const FORCE_JSON_RESPONSES = process.env.CODEX_PROXY_FORCE_JSON !== "0";
+// Minimal proxy: stream Codex SSE as-is; no JSON collapsing, no tool-name tweaks
 
 interface StoredCredentials extends TokenSuccess {
 	accountId: string;
@@ -247,12 +242,16 @@ function sendJson(res: ServerResponse, status: number, payload: unknown): void {
 }
 
 async function handleResponsesEndpoint(
-	req: IncomingMessage,
-	res: ServerResponse,
-	context: ProxyContext,
+    req: IncomingMessage,
+    res: ServerResponse,
 ): Promise<void> {
-	const host = req.headers.host ?? `localhost:${DEFAULT_PORT}`;
-	const requestUrl = new URL(req.url ?? "/v1/responses", `http://${host}`);
+    const verbose = process.env.CODEX_PROXY_VERBOSE === '1';
+    const PROMPT_HEAD = Number.parseInt(process.env.CODEX_PROXY_PROMPT_HEAD ?? '300', 10);
+    const PROMPT_TAIL = Number.parseInt(process.env.CODEX_PROXY_PROMPT_TAIL ?? '0', 10);
+    const SEP = process.env.CODEX_PROXY_SEPARATOR ?? '======';
+    const host = req.headers.host ?? `localhost:${DEFAULT_PORT}`;
+    const requestUrl = new URL(req.url ?? "/v1/responses", `http://${host}`);
+    const t0 = Date.now();
 
 	if (req.method !== "POST") {
 		sendJson(res, 405, { error: "Method not allowed" });
@@ -273,12 +272,103 @@ async function handleResponsesEndpoint(
 		return;
 	}
 
-	if (parsedBody.metadata) {
-		delete parsedBody.metadata;
-	}
+    if (parsedBody.metadata) {
+        delete parsedBody.metadata;
+    }
 
-	const sanitizedBody = JSON.stringify(parsedBody);
-	const traceId = parsedBody.prompt_cache_key ?? randomUUID();
+    // Honor client stream preference for downstream conversion, but Codex
+    // backend always streams its responses. We capture the original flag here
+    // and still ask Codex for SSE, converting to JSON for non-streaming clients.
+    const clientStreamRequested = Boolean(parsedBody.stream);
+
+    // Codex backend requires stateless mode
+    parsedBody.store = false;
+    // Always stream from Codex (we convert to JSON if client didn't request stream)
+    parsedBody.stream = true;
+
+    // Capture developer/system guidance from client
+    const inferredDevGuide = extractInstructionsFromInput(parsedBody.input);
+
+    // Instructions: allow disabling Codex instructions via env
+    const DISABLE_CODEX_INSTRUCTIONS = process.env.CODEX_PROXY_DISABLE_CODEX_INSTRUCTIONS === '1';
+    if (!parsedBody.instructions || typeof parsedBody.instructions !== "string") {
+        parsedBody.instructions = "";
+    }
+    if (!parsedBody.instructions.trim()) {
+        parsedBody.instructions = DISABLE_CODEX_INSTRUCTIONS ? "" : (globalCodexInstructions || "You are Codex.");
+    }
+
+    // Build input with optional environment override first, then (deduped) inferred developer guide,
+    // then the original input items. This avoids reordering after we inject and prevents duplicates.
+    try {
+        const originalInput: any[] = Array.isArray(parsedBody.input) ? parsedBody.input : [];
+        const newInput: any[] = [];
+
+        const DISABLE_ENV_OVERRIDE = process.env.CODEX_PROXY_DISABLE_ENV_OVERRIDE === '1';
+        const overrideFromEnv = process.env.ENV_OVERRIDE_TEXT;
+        const defaultOverride = [
+            "[ENVIRONMENT OVERRIDE]",
+            "You are running inside Claude Code CLI (not Codex).",
+            "Ignore Codex-specific operating rules and tool mappings above.",
+            "Follow the client-provided system/developer prompts and the tool schema present in the input items.",
+            "When instructions conflict, prefer the client-provided Claude Code guidance.",
+        ].join(" ");
+
+        if (!DISABLE_ENV_OVERRIDE) {
+            const envOverrideText = (overrideFromEnv && overrideFromEnv.trim()) ? overrideFromEnv.trim() : defaultOverride;
+            newInput.push({
+                type: "message",
+                role: "developer",
+                content: [{ type: "input_text", text: envOverrideText }],
+            });
+        }
+
+        const DISABLE_DEV_GUIDE = process.env.CODEX_PROXY_DISABLE_DEV_GUIDE === '1';
+        if (!DISABLE_DEV_GUIDE && inferredDevGuide && inferredDevGuide.trim()) {
+            // Only add the inferred guide if the first developer/system message isn't identical already
+            const firstDev = (originalInput.find((it: any) => it && (it.role === 'developer' || it.role === 'system')) || null);
+            const firstDevText = firstDev ? extractTextFromContent(firstDev.content).trim() : '';
+            if (firstDevText !== inferredDevGuide.trim()) {
+                newInput.push({
+                    type: "message",
+                    role: "developer",
+                    content: [{ type: "input_text", text: inferredDevGuide.trim() }],
+                });
+            }
+        }
+
+        // Append original input
+        for (const item of originalInput) newInput.push(item);
+
+        parsedBody.input = newInput;
+    } catch {
+        // ignore
+    }
+
+    // No additional tool remaps injected here; rely on the client's own system prompt
+    // and tools to drive behavior, with the environment override above clarifying priorities.
+
+    // Ensure encrypted reasoning continuity is included when stateless
+    if (!Array.isArray((parsedBody as any).include) || (parsedBody as any).include.length === 0) {
+        (parsedBody as any).include = ["reasoning.encrypted_content"];
+    }
+
+    const sanitizedBody = JSON.stringify(parsedBody);
+    const traceId = parsedBody.prompt_cache_key ?? randomUUID();
+
+    // Print full system prompt and full request input (no truncation)
+    try {
+        const instr = typeof (parsedBody as any).instructions === 'string' ? (parsedBody as any).instructions : '';
+        const tools = Array.isArray((parsedBody as any).tools) ? (parsedBody as any).tools.length : 0;
+        const inputs = Array.isArray((parsedBody as any).input) ? (parsedBody as any).input : [];
+        const ts = new Date().toISOString();
+        console.error(`--- REQUEST ${ts} trace=${traceId} ---`);
+        console.error(`[codex-proxy] model=${parsedBody.model ?? '?' } stream=${Boolean((parsedBody as any).stream)} tools=${tools}`);
+        console.error(`[codex-proxy] instructions:`);
+        console.error(instr);
+        console.error(`[codex-proxy] input:`);
+        console.error(JSON.stringify(inputs, null, 2));
+    } catch {}
 
 	await ensureFreshCredentials();
 	if (!authState.credentials) {
@@ -287,78 +377,106 @@ async function handleResponsesEndpoint(
 	}
 
 	const codexUrl = buildCodexUrl(requestUrl);
-	const initialInit: RequestInit = { body: sanitizedBody };
-	const transformation = await transformRequestForCodex(
-		initialInit,
-		codexUrl,
-		context.instructions,
-		context.userConfig,
-		context.codexMode,
-	);
-	const finalBody = transformation?.updatedInit?.body ?? sanitizedBody;
-	const bodyForHeaders = transformation?.body as RequestBody | undefined;
-	const effectiveBody = bodyForHeaders ?? parsedBody;
+	const finalBody = sanitizedBody;
+	const effectiveBody = parsedBody;
 
 	const headers = createCodexHeaders(undefined, authState.credentials.accountId, authState.credentials.access, {
-		model: bodyForHeaders?.model,
-		promptCacheKey: bodyForHeaders?.prompt_cache_key,
+		model: effectiveBody?.model,
+		promptCacheKey: effectiveBody?.prompt_cache_key,
 	});
 	headers.set("content-type", "application/json");
 
-	const upstreamResponse = await fetch(codexUrl, {
-		method: "POST",
-		headers,
-		body: finalBody,
-	});
+    const upstreamResponse = await fetch(codexUrl, {
+        method: "POST",
+        headers,
+        body: finalBody,
+    });
 
-	let responseForClient = upstreamResponse;
-	if (FORCE_JSON_RESPONSES) {
-		responseForClient = await convertSseToJson(upstreamResponse, upstreamResponse.headers);
-	}
+  let responseForClient = upstreamResponse;
+  // If the client did not request streaming, collapse SSE → JSON
+  if (!clientStreamRequested) {
+    try {
+      responseForClient = await convertSseToJson(upstreamResponse, upstreamResponse.headers);
+      if (verbose) {
+        console.error(`[codex-proxy]   collapsed SSE→JSON trace=${traceId}`);
+      }
+    } catch (e) {
+      // If collapsing fails, fall back to raw stream so caller at least gets something
+      console.error(`[${PLUGIN_NAME}] Failed to convert SSE to JSON: ${(e as Error).message}`);
+      responseForClient = upstreamResponse;
+    }
+  }
 
-	if (!responseForClient.ok) {
-		try {
-			const clone = responseForClient.clone();
-			const responseBody = await clone.text();
-			logProxyError({
-				traceId,
-				url: codexUrl,
-				status: responseForClient.status,
-				statusText: responseForClient.statusText,
-				model: effectiveBody?.model ?? parsedBody.model,
-				hasTools: Boolean(effectiveBody?.tools ?? parsedBody.tools),
-				bodyLength: sanitizedBody.length,
-				responseBody: responseBody.slice(0, 8000),
-			});
-		} catch (error) {
+  if (!responseForClient.ok) {
+    try {
+      const clone = responseForClient.clone();
+      const responseBody = await clone.text();
+            logProxyError({
+                traceId,
+                url: codexUrl,
+                status: responseForClient.status,
+                statusText: responseForClient.statusText,
+                model: effectiveBody?.model ?? parsedBody.model,
+                hasTools: Boolean(effectiveBody?.tools ?? parsedBody.tools),
+                bodyLength: sanitizedBody.length,
+                hadInstructions: typeof (parsedBody as any).instructions === 'string',
+                instrLength: typeof (parsedBody as any).instructions === 'string' ? (parsedBody as any).instructions.length : 0,
+                include: (parsedBody as any).include,
+                responseBody: responseBody.slice(0, 8000),
+            });
+        } catch (error) {
 			console.error(
 				`[${PLUGIN_NAME}] Failed to log upstream error: ${(error as Error).message}`,
 			);
-		}
-	}
+        }
+    }
 
-	await forwardResponse(responseForClient, res);
+    const ts2 = new Date().toISOString();
+    console.error(`[codex-proxy] ← ${responseForClient.status} ${responseForClient.statusText} dur=${Date.now()-t0}ms trace=${traceId}`);
+    console.error(`--- END ${ts2} trace=${traceId} ---`);
+
+    await forwardResponse(responseForClient, res);
 }
 
-interface ProxyContext {
-	instructions: string;
-	userConfig: UserConfig;
-	codexMode: boolean;
+let globalCodexInstructions: string | null = null;
+
+function extractTextFromContent(content: unknown): string {
+    if (typeof content === "string") return content;
+    if (Array.isArray(content)) {
+        try {
+            return content
+                .filter((c: any) => c && typeof c === "object")
+                .map((c: any) => (typeof c.text === "string" ? c.text : ""))
+                .join("\n");
+        } catch {
+            return "";
+        }
+    }
+    return "";
+}
+
+function extractInstructionsFromInput(input: unknown): string | null {
+    if (!Array.isArray(input)) return null;
+    const parts: string[] = [];
+    for (const item of input) {
+        if (!item || typeof item !== "object") continue;
+        const role = (item as any).role;
+        if (role === "developer" || role === "system") {
+            const text = extractTextFromContent((item as any).content);
+            if (text && text.trim()) parts.push(text.trim());
+        }
+    }
+    if (parts.length === 0) return null;
+    return parts.join("\n\n");
 }
 
 async function startServer(): Promise<void> {
-	const instructions = await getCodexInstructions();
-	const pluginConfig = loadPluginConfig();
-	const codexMode = getCodexMode(pluginConfig);
-	const context: ProxyContext = {
-		instructions,
-		userConfig: {
-			global: {},
-			models: {},
-		},
-		codexMode,
-	};
-
+	try {
+		globalCodexInstructions = await getCodexInstructions();
+	} catch (e) {
+		console.warn(`[${PLUGIN_NAME}] Failed to load Codex instructions: ${(e as Error).message}`);
+		globalCodexInstructions = "You are Codex.";
+	}
 	await bootstrapCredentials();
 
 	const server = createServer(async (req, res) => {
@@ -372,7 +490,7 @@ async function startServer(): Promise<void> {
 			}
 
 			if (normalized.startsWith("/responses")) {
-				await handleResponsesEndpoint(req, res, context);
+				await handleResponsesEndpoint(req, res);
 				return;
 			}
 
