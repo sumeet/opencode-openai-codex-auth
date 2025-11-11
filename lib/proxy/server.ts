@@ -4,6 +4,8 @@ import { ReadableStream as NodeReadableStream } from "node:stream/web";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { promises as fsp } from "node:fs";
+import { extname } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { randomUUID } from "node:crypto";
 
@@ -326,8 +328,42 @@ async function handleResponsesEndpoint(
         // Keep it simple: do not duplicate or reposition existing developer/system guidance.
         // We only prepend the environment override, then append the original input as-is.
 
-        // Append original input
-        for (const item of originalInput) newInput.push(item);
+        // Append original input (and inline/fix image data URLs if needed)
+        for (const item of originalInput) {
+            if (item && typeof item === 'object' && Array.isArray((item as any).content)) {
+                for (const part of (item as any).content) {
+                    if (part && typeof part === 'object' && typeof (part as any).image_url === 'string') {
+                        const v = (part as any).image_url as string;
+                        // Normalize odd cases like data:image/png;base64,{ 'data': '...' }
+                        let normalized = v;
+                        try {
+                            const comma = v.indexOf(',');
+                            if (v.startsWith('data:') && comma > 0 && v.slice(comma+1).trim().startsWith('{')) {
+                                // Attempt to extract 'data' and 'media_type' from the object
+                                const tail = v.slice(comma+1).trim();
+                                const mediaMatch = tail.match(/'media_type'\s*:\s*'([^']+)'/);
+                                const dataMatch = tail.match(/'data'\s*:\s*'([^']+)'/s);
+                                const media = mediaMatch ? mediaMatch[1] : 'image/png';
+                                const b64 = dataMatch ? dataMatch[1].replace(/\s+/g, '') : '';
+                                if (b64) normalized = `data:${media};base64,${b64}`;
+                            }
+                        } catch {}
+
+                        // Fix missing subtype in data URLs
+                        normalized = fixImageDataUrl(normalized);
+
+                        // If it's not a data URL, try to inline from file/http
+                        if (!normalized.startsWith('data:')) {
+                            try {
+                                normalized = await inlineImageUrl(normalized);
+                            } catch {}
+                        }
+                        (part as any).image_url = normalized;
+                    }
+                }
+            }
+            newInput.push(item);
+        }
 
         parsedBody.input = newInput;
     } catch {
@@ -457,6 +493,120 @@ function extractInstructionsFromInput(input: unknown): string | null {
     }
     if (parts.length === 0) return null;
     return parts.join("\n\n");
+}
+
+function guessImageMimeFromBase64(dataUrl: string): string {
+    // dataUrl is expected to be 'data:...;base64,<b64>'
+    const idx = dataUrl.indexOf(',');
+    if (idx === -1) return 'image/png';
+    const head = dataUrl.slice(0, idx);
+    const b64 = dataUrl.slice(idx + 1);
+    const prefix = b64.slice(0, 8);
+    if (prefix.startsWith('iVBORw0K')) return 'image/png'; // PNG
+    if (prefix.startsWith('/9j/')) return 'image/jpeg'; // JPEG
+    if (prefix.startsWith('R0lGOD')) return 'image/gif'; // GIF
+    if (prefix.startsWith('UklGR')) return 'image/webp'; // WEBP
+    if (prefix.startsWith('Qk')) return 'image/bmp'; // BMP
+    return 'image/png';
+}
+
+function fixImageDataUrl(url: string): string {
+    // Fix cases like 'data:image;base64,...' or 'data:;base64,...'
+    if (url.startsWith('data:image;base64,')) {
+        const mime = guessImageMimeFromBase64(url);
+        return url.replace('data:image;base64,', `data:${mime};base64,`);
+    }
+    if (url.startsWith('data:;base64,')) {
+        const mime = guessImageMimeFromBase64(url);
+        return url.replace('data:;base64,', `data:${mime};base64,`);
+    }
+    // Already has a specific subtype like data:image/png;base64,... -> leave
+    return url;
+}
+
+function mimeFromExt(p: string): string | null {
+    const e = extname(p).toLowerCase();
+    if (e === ".png") return "image/png";
+    if (e === ".jpg" || e === ".jpeg") return "image/jpeg";
+    if (e === ".gif") return "image/gif";
+    if (e === ".webp") return "image/webp";
+    if (e === ".bmp") return "image/bmp";
+    return null;
+}
+
+function detectMimeFromBuffer(buf: Uint8Array): string | null {
+    if (!buf || buf.length < 12) return null;
+    // PNG
+    if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47 && buf[4] === 0x0D && buf[5] === 0x0A && buf[6] === 0x1A && buf[7] === 0x0A) {
+        return 'image/png';
+    }
+    // JPEG
+    if (buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) {
+        return 'image/jpeg';
+    }
+    // GIF
+    if (
+        buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 &&
+        buf[3] === 0x38 && (buf[4] === 0x39 || buf[4] === 0x37) && buf[5] === 0x61
+    ) {
+        return 'image/gif';
+    }
+    // WEBP (RIFF....WEBP)
+    if (
+        buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46 &&
+        buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50
+    ) {
+        return 'image/webp';
+    }
+    // BMP
+    if (buf[0] === 0x42 && buf[1] === 0x4D) {
+        return 'image/bmp';
+    }
+    return null;
+}
+
+async function inlineImageUrl(value: string): Promise<string> {
+    try {
+        if (value.startsWith("data:")) {
+            return fixImageDataUrl(value);
+        }
+
+        // http(s) URLs
+        if (value.startsWith("http://") || value.startsWith("https://")) {
+            const resp = await fetch(value);
+            if (!resp.ok) return value;
+            const buf = new Uint8Array(await resp.arrayBuffer());
+            const b64 = Buffer.from(buf).toString("base64");
+            const sniff = detectMimeFromBuffer(buf);
+            const ctype = resp.headers.get("content-type");
+            const mime = (sniff || (ctype && ctype.startsWith('image/') && ctype.split(';')[0]) || guessImageMimeFromBase64(`data:;base64,${b64}`));
+            return `data:${mime};base64,${b64}`;
+        }
+
+        // file path (absolute or relative); inline if exists
+        if (existsSync(value)) {
+            const buf = await fsp.readFile(value);
+            const b64 = buf.toString("base64");
+            const sniff = detectMimeFromBuffer(buf);
+            const mime = sniff || mimeFromExt(value) || guessImageMimeFromBase64(`data:;base64,${b64}`);
+            return `data:${mime};base64,${b64}`;
+        }
+
+        // file:// URLs
+        if (value.startsWith("file://")) {
+            const p = value.replace(/^file:\/\//, "");
+            if (existsSync(p)) {
+                const buf = await fsp.readFile(p);
+                const b64 = buf.toString("base64");
+                const sniff = detectMimeFromBuffer(buf);
+                const mime = sniff || mimeFromExt(p) || guessImageMimeFromBase64(`data:;base64,${b64}`);
+                return `data:${mime};base64,${b64}`;
+            }
+        }
+    } catch {
+        // fall through
+    }
+    return value;
 }
 
 async function startServer(): Promise<void> {
